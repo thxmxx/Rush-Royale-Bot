@@ -2,7 +2,10 @@ import os
 import time
 import numpy as np
 import pandas as pd
+import random
 import logging
+import asyncio
+import telegram_bot
 from subprocess import Popen, DEVNULL
 # Android ADB
 from scrcpy import Client, const
@@ -11,6 +14,7 @@ import cv2
 # internal
 import bot_perception
 import port_scan
+import faulthandler
 
 SLEEP_DELAY = 0.1
 
@@ -18,16 +22,19 @@ SLEEP_DELAY = 0.1
 class Bot:
 
     def __init__(self, device=None):
+        faulthandler.enable()
         self.bot_stop = False
+        self.cursed_board = False
         self.combat = self.output = self.grid_df = self.unit_series = self.merge_series = self.df_groups = self.info = self.combat_step = None
         self.logger = logging.getLogger('__main__')
+        device = '192.168.57.110:5555'
         if device is None:
             device = port_scan.get_device()
         if not device:
             raise Exception("No device found!")
         self.device = device
         self.bot_id = self.device.split(':')[-1]
-        self.shell(f'.scrcpy\\adb connect {self.device}')
+        self.shell(f'adb connect {self.device}')
         # Try to launch application through ADB shell
         self.shell('monkey -p com.my.defense 1')
         # Check if 'bot_feed.png' exists
@@ -49,7 +56,9 @@ class Bot:
 
     # Function to send ADB shell command
     def shell(self, cmd):
-        p = Popen([".scrcpy\\adb", '-s', self.device, 'shell', cmd], stdout=DEVNULL, stderr=DEVNULL)
+        if not cmd.startswith('adb'):
+            cmd = f'adb -s {self.device} shell {cmd}'
+        p = Popen(cmd, shell=True, stdout=DEVNULL, stderr=DEVNULL)
         p.wait()
 
     # Send ADB to click screen
@@ -70,7 +79,8 @@ class Bot:
         boxes, box_size = get_grid()
         # Offset from box edge
         offset = 60
-        self.client.control.swipe(*boxes[start[0], start[1]] + offset, *boxes[end[0], end[1]] + offset, 20, 1 / 60)
+        self.client.control.swipe(
+            *boxes[start[0], start[1]] + offset, *boxes[end[0], end[1]] + offset, 20, 1 / 60)
 
     # Send key command, see py-scrcpy consts
     def key_input(self, key):
@@ -80,19 +90,21 @@ class Bot:
     def restart_RR(self, quick_disconnect=False):
         if quick_disconnect:
             for i in range(15):
-                self.shell('monkey -p com.my.defense 1')  # disconnects really quick for unknown reasons
+                # disconnects really quick for unknown reasons
+                self.shell('monkey -p com.my.defense 1')
             return
         # Force kill game through ADB shell
         self.shell('am force-stop com.my.defense')
         time.sleep(2)
         # Launch application through ADB shell
         self.shell('monkey -p com.my.defense 1')
-        time.sleep(10)  # wait for app to load
+        time.sleep(15)  # wait for app to load
 
     # Take screenshot of device screen and load pixel values
     def getScreen(self):
         bot_id = self.device.split(':')[-1]
-        p = Popen(['.scrcpy\\adb', 'exec-out', 'screencap', '-p', '>', f'bot_feed_{bot_id}.png'], shell=True)
+        p = Popen(
+            f'adb exec-out screencap -p > bot_feed_{bot_id}.png', shell=True)
         p.wait()
         # Store screenshot in class variable if valid
         new_img = cv2.imread(f'bot_feed_{bot_id}.png')
@@ -113,7 +125,8 @@ class Bot:
 
     # find icon on screen
     def getXYByImage(self, target, new=True):
-        valid_targets = ['battle_icon', 'pvp_button', 'back_button', 'cont_button', 'fighting']
+        valid_targets = ['battle_icon', 'pvp_button',
+                         'back_button', 'cont_button', 'fighting']
         if not target in valid_targets:
             return "INVALID TARGET"
         if new:
@@ -132,14 +145,36 @@ class Bot:
 
     def get_store_state(self):
         x, y = [140, 1412]
-        store_states_names = ['refresh', 'new_store', 'nothing', 'new_offer', 'spin_only']
-        store_states = np.array([[255, 255, 255], [27, 235, 206], [63, 38, 12], [48, 253, 251], [80, 153, 193]])
+        store_states_names = ['refresh', 'new_store',
+                              'nothing', 'new_offer', 'spin_only']
+        store_states = np.array([[255, 255, 255], [27, 235, 206], [
+                                63, 38, 12], [48, 253, 251], [80, 153, 193]])
         store_rgb = self.screenRGB[y:y + 1, x:x + 1]
         store_rgb = store_rgb[0][0]
         # Take mean square of rgb value and store states
         store_mse = ((store_states - store_rgb)**2).mean(axis=1)
         closest_state = store_mse.argmin()
         return store_states_names[closest_state]
+
+    # Get floor title position
+    def get_floor(self, floor_number: int):
+        self.getScreen()
+        img_rgb = self.screenRGB
+        img_gray = cv2.cvtColor(img_rgb, cv2.COLOR_BGR2GRAY)
+        x = 0
+        y = 0
+        # Load icon
+        imgSrc = f'floors/floor_{floor_number}.png'
+        template = cv2.imread(imgSrc, 0)
+        # Compare images
+        res = cv2.matchTemplate(img_gray, template, cv2.TM_CCOEFF_NORMED)
+        threshold = 0.8
+        loc = np.where(res >= threshold)
+        icon_found = len(loc[0]) > 0
+        if icon_found:
+            y = loc[0][0]
+            x = loc[1][0]
+        return (icon_found, (x, y))
 
     # Check if any icons are on screen
     def get_current_icons(self, new=True, available=False):
@@ -149,13 +184,19 @@ class Bot:
             self.getScreen()
         img_rgb = self.screenRGB
         img_gray = cv2.cvtColor(img_rgb, cv2.COLOR_BGR2GRAY)
+        # print(f'img_gray {img_gray.shape}')
+        # cv2.namedWindow('test', cv2.WINDOW_NORMAL)
+        # cv2.imshow('test', img_gray)
         # Check every target in dir
         for target in os.listdir("icons"):
+            enabled = False
             x = 0  # reset position
             y = 0
             # Load icon
             imgSrc = f'icons/{target}'
             template = cv2.imread(imgSrc, 0)
+            # cv2.namedWindow(imgSrc, cv2.WINDOW_NORMAL)
+            # cv2.imshow(imgSrc, template)
             # Compare images
             res = cv2.matchTemplate(img_gray, template, cv2.TM_CCOEFF_NORMED)
             threshold = 0.8
@@ -164,11 +205,18 @@ class Bot:
             if icon_found:
                 y = loc[0][0]
                 x = loc[1][0]
-            current_icons.append([target, icon_found, (x, y)])
-        icon_df = pd.DataFrame(current_icons, columns=['icon', 'available', 'pos [X,Y]'])
+                b, _, _ = img_rgb[y+12][x+12]
+                enabled = b > 200
+
+            current_icons.append([target, icon_found, (x, y), enabled])
+        # cv2.waitKey(0)
+        # cv2.destroyAllWindows()
+        icon_df = pd.DataFrame(current_icons, columns=[
+                               'icon', 'available', 'pos [X,Y]', 'enabled'])
         # filter out only available buttons
         if available:
-            icon_df = icon_df[icon_df['available'] == True].reset_index(drop=True)
+            icon_df = icon_df[icon_df['available']
+                              == True].reset_index(drop=True)
         return icon_df
 
     # Scan battle grid, update OCR images
@@ -216,7 +264,8 @@ class Bot:
             adv_filter_keys(merge_series, units=special_type, remove=remove) for remove in [False, True]
         ]  # scrapper support not tested
         # Get corresponding dataframes
-        special_df, normal_df = [df_split.get_group(unit.index[0]).sample() for unit in [special_unit, normal_unit]]
+        special_df, normal_df = [df_split.get_group(unit.index[0]).sample() for unit in [
+            special_unit, normal_unit]]
         merge_df = pd.concat([special_df, normal_df])
         self.log_merge(merge_df)
         # Merge 'em
@@ -226,7 +275,8 @@ class Bot:
         return merge_df
 
     def log_merge(self, merge_df):
-        merge_df['unit'] = merge_df['unit'].apply(lambda x: x.replace('.png', ''))
+        merge_df['unit'] = merge_df['unit'].apply(
+            lambda x: x.replace('.png', ''))
         unit1, unit2 = merge_df.iloc[0:2]['unit']
         rank = merge_df.iloc[0]['rank']
         log_msg = f"Rank {rank} {unit1}-> {unit2}"
@@ -246,13 +296,17 @@ class Bot:
         if not dryads_series.empty:
             dryads_rank = dryads_series.index.get_level_values('rank')
             for rank in dryads_rank:
-                merge_series_dryad = adv_filter_keys(merge_series, units=['harlequin.png', 'dryad.png'], ranks=rank)
-                merge_series_zealot = adv_filter_keys(merge_series, units=['dryad.png', target], ranks=rank)
+                merge_series_dryad = adv_filter_keys(
+                    merge_series, units=['harlequin.png', 'dryad.png'], ranks=rank)
+                merge_series_target = adv_filter_keys(
+                    merge_series, units=['dryad.png', target], ranks=rank)
                 if len(merge_series_dryad.index) == 2:
-                    merge_df = self.merge_special_unit(df_split, merge_series_dryad, special_type='harlequin.png')
+                    merge_df = self.merge_special_unit(
+                        df_split, merge_series_dryad, special_type='harlequin.png')
                     break
-                if len(merge_series_zealot.index) == 2:
-                    merge_df = self.merge_special_unit(df_split, merge_series_zealot, special_type='dryad.png')
+                if len(merge_series_target.index) == 2:
+                    merge_df = self.merge_special_unit(
+                        df_split, merge_series_target, special_type='dryad.png')
                     break
         return merge_df
 
@@ -264,9 +318,11 @@ class Bot:
         if not hq_series.empty:
             hq_rank = hq_series.index.get_level_values('rank')
             for rank in hq_rank:
-                merge_series_target = adv_filter_keys(merge_series, units=['harlequin.png', target], ranks=rank)
+                merge_series_target = adv_filter_keys(
+                    merge_series, units=['harlequin.png', target], ranks=rank)
                 if len(merge_series_target.index) == 2:
-                    merge_df = self.merge_special_unit(df_split, merge_series_target, special_type='harlequin.png')
+                    merge_df = self.merge_special_unit(
+                        df_split, merge_series_target, special_type='harlequin.png')
                     break
         return merge_df
 
@@ -279,13 +335,18 @@ class Bot:
         df_split, unit_series, df_groups, group_keys = grid_meta_info(grid_df)
         # Select stuff to merge
         merge_series = unit_series.copy()
+
         # Remove empty groups
-        merge_series = adv_filter_keys(merge_series, units='empty.png', remove=True)
+        merge_series = adv_filter_keys(
+            merge_series, units='empty.png', remove=True)
         # Do special merge with dryad/Harley
         self.special_merge(df_split, merge_series, merge_target)
+
+        almost_full_board = sum(merge_series) >= 14
+
         # Use harely on high dps targets
         if merge_target == 'demon_hunter.png':
-            self.harley_merge(df_split, merge_series, target=merge_target)
+            self.harley_merge(df_split, merge_series, target='sword.png')
             # Remove all demons (for co-op)
             demons = adv_filter_keys(merge_series, units='demon_hunter.png')
             num_demon = sum(demons)
@@ -294,24 +355,48 @@ class Bot:
                 self.logger.info(f'Board is full of demons, waiting...')
                 time.sleep(10)
             if self.config.getboolean('bot', 'require_shaman'):
-                merge_series = adv_filter_keys(merge_series, units='demon_hunter.png', remove=True)
-        merge_series = preserve_unit(merge_series, target='chemist.png')
-        # Remove 4x cauldrons
-        for _ in range(4):
-            merge_series = preserve_unit(merge_series, target='cauldron.png', keep_min=True)
+                merge_series = adv_filter_keys(
+                    merge_series, units='demon_hunter.png', remove=True)
+            for _ in range(15):
+                merge_series = preserve_unit(
+                    merge_series, target='demon_hunter.png')
+        if not almost_full_board:
+            merge_series = preserve_unit(
+                merge_series, target='chemist.png')
+
+        self.cursed_board = False
+
+        avail_buttons = self.get_current_icons(available=True)
+        if (avail_buttons == 'badluck.png').any(axis=None):
+            info = 'Bad Luck! Stopped merging'
+            return grid_df, unit_series, merge_series, merge_df, info
+        if (avail_buttons == 'curse.png').any(axis=None):
+            info = 'Cursed board! Stopped spawning'
+            self.cursed_board = True
+            return grid_df, unit_series, merge_series, merge_df, info
+
+        if not almost_full_board:
+            # Remove 1x cauldrons
+            for _ in range(1):
+                merge_series = preserve_unit(
+                    merge_series, target='cauldron.png')
         # Try to keep knight_statue numbers even (can conflict if special_merge already merged)
-        num_knight = sum(adv_filter_keys(merge_series, units='knight_statue.png'))
+        num_knight = sum(adv_filter_keys(
+            merge_series, units='knight_statue.png'))
         if num_knight % 2 == 1:
-            self.harley_merge(df_split, merge_series, target='knight_statue.png')
+            self.harley_merge(df_split, merge_series,
+                              target='knight_statue.png')
         # Preserve 2 highest knight statues
         for _ in range(2):
-            merge_series = preserve_unit(merge_series, target='knight_statue.png')
+            merge_series = preserve_unit(
+                merge_series, target='knight_statue.png')
         # Select stuff to merge
         merge_series = merge_series[merge_series >= 2]  # At least 2 units
-        merge_series = adv_filter_keys(merge_series, ranks=7, remove=True)  # Remove max ranks
+        merge_series = adv_filter_keys(
+            merge_series, ranks=7, remove=True)  # Remove max ranks
         # Try to merge high priority units
         merge_prio = adv_filter_keys(merge_series,
-                                     units=['chemist.png', 'bombardier.png', 'summoner.png', 'knight_statue.png'])
+                                     units=['sword.png', 'trapper.png', 'cauldron.png', 'chemist.png', 'bombardier.png', 'summoner.png', 'knight_statue.png'])
         if not merge_prio.empty:
             info = 'Merging High Priority!'
             merge_df = self.merge_unit(df_split, merge_prio)
@@ -319,7 +404,8 @@ class Bot:
         if df_groups['empty.png'] <= 2:
             info = 'Merging!'
             # Add criteria
-            low_series = adv_filter_keys(merge_series, ranks=rank, remove=False)
+            low_series = adv_filter_keys(
+                merge_series, ranks=rank, remove=False)
             if not low_series.empty:
                 merge_df = self.merge_unit(df_split, low_series)
             else:
@@ -327,7 +413,8 @@ class Bot:
                 info = 'Merging high level!'
                 merge_series = adv_filter_keys(merge_series,
                                                ranks=[3, 4, 5, 6, 7],
-                                               units=['zealot.png', 'crystal.png', 'bruser.png', merge_target],
+                                               units=[
+                                                   'zealot.png', 'crystal.png', 'bruser.png', merge_target],
                                                remove=True)
                 if not merge_series.empty:
                     merge_df = self.merge_unit(df_split, merge_series)
@@ -337,15 +424,26 @@ class Bot:
 
     # Mana level cards
     def mana_level(self, cards, hero_power=False):
-        upgrade_pos_dict = {1: [100, 1500], 2: [200, 1500], 3: [350, 1500], 4: [500, 1500], 5: [650, 1500]}
-        # Level each card
+        upgrade_pos_dict = {1: [100, 1500], 2: [200, 1500], 3: [
+            350, 1500], 4: [500, 1500], 5: [650, 1500]}
+        # check if the boss is puppetter
+        img_rgb = self.screenRGB
+        img_gray = cv2.cvtColor(img_rgb, cv2.COLOR_BGR2GRAY)
+        imgSrc = f'bosses/puppeteer.png'
+        template = cv2.imread(imgSrc, 0)
+        res = cv2.matchTemplate(img_gray, template, cv2.TM_CCOEFF_NORMED)
+        threshold = 0.8
+        loc = np.where(res >= threshold)
+        isPuppeteer = len(loc[0]) > 0
         for card in cards:
-            self.click(*upgrade_pos_dict[card])
+            if not isPuppeteer:
+                self.click(*upgrade_pos_dict[card])
         if hero_power:
             self.click(800, 1500)
 
     # Start a dungeon floor from PvE page
     def play_dungeon(self, floor=5):
+
         self.logger.debug(f'Starting Dungeon floor {floor}')
         # Divide by 3 and take ceiling of floor as int
         target_chapter = f'chapter_{int(np.ceil((floor)/3))}.png'
@@ -357,7 +455,7 @@ class Bot:
             # Swipe to the top
             [self.swipe([0, 0], [2, 0]) for i in range(14)]
             self.click(30, 600, 5)  # stop scroll and scan screen for buttons
-            # Keep swiping until floor is found
+            # Keep swiping until chapter is found
             expanded = 0
             for i in range(10):
                 # Scan screen for buttons
@@ -368,39 +466,61 @@ class Bot:
                     if not expanded:
                         expanded = 1
                         self.click_button(pos + [500, 90])
-                    # check button is near top of screen
-                    if pos[1] < 550 and floor % 3 != 0:
-                        # Stop scrolling when chapter is near top
                         break
-                elif (avail_buttons == next_chapter).any(axis=None) and floor % 3 == 0:
-                    pos = get_button_pos(avail_buttons, next_chapter)
-                    # Stop scrolling if the next chapter is found and last floor of chapter is chosen
                     break
                 # Contiue to swiping to find correct chapter
                 [self.swipe([2, 0], [0, 0]) for i in range(2)]
-                self.click(30, 600)  # stop scroll
+                self.click(590, 800)  # stop scroll
 
-            # Click play floor if found
-            if not (pos == np.array([0, 0])).any():
-                if floor % 3 == 0:
-                    self.click_button(pos + [30, -460])
-                elif floor % 3 == 1:
-                    self.click_button(pos + [30, 485])
-                elif floor % 3 == 2:
-                    self.click_button(pos + [30, 885])
-                self.click_button((500, 600))
-                for i in range(10):
-                    time.sleep(2)
-                    avail_buttons = self.get_current_icons(available=True)
-                    # Look for correct chapter
-                    self.logger.info(f'Waiting for match to start {i}')
-                    if avail_buttons['icon'].isin(['back_button.png', 'fighting.png']).any():
-                        break
+            # Keep swiping until floor is found
+            for i in range(10):
+                ret = self.get_floor(floor)
+                if not ret[0]:
+                    self.logger.warning(f'Floor {floor} not found!')
+                    # Contiue to swiping to find correct floor
+                    [self.swipe([2, 0], [0, 0]) for i in range(4)]
+                    self.click(590, 800)  # stop scroll
+                else:
+                    x = ret[1][0] + 335
+                    y = ret[1][1] + 280
+                    self.click(x, y)
+                    time.sleep(1)
+                    # click on maps
+                    # if random.randint(0, 1) == 0:
+                    #     self.click(350, 1400)
+                    # else:
+                    #     self.click(530, 1400)
+                    self.click(600, 700)
+                    for i in range(100):
+                        time.sleep(2)
+                        avail_buttons = self.get_current_icons(available=True)
+                        self.logger.info(f'Waiting for match to start {i}')
+                        if avail_buttons['icon'].isin(['back_button.png', 'fighting.png']).any():
+                            break
+                    break
+
+            # # Click play floor if found
+            # if not (pos == np.array([0, 0])).any():
+            #     if floor % 3 == 0:
+            #         self.click_button(pos + [30, -460])
+            #     elif floor % 3 == 1:
+            #         self.click_button(pos + [30, 485])
+            #     elif floor % 3 == 2:
+            #         self.click_button(pos + [30, 885])
+            #     self.click_button((500, 600))
+            #     for i in range(100):
+            #         time.sleep(2)
+            #         avail_buttons = self.get_current_icons(available=True)
+            #         # Look for correct chapter
+            #         self.logger.info(f'Waiting for match to start {i}')
+            #         if avail_buttons['icon'].isin(['back_button.png', 'fighting.png']).any():
+            #             break
 
     # Locate game home screen and try to start fight is chosen
     def battle_screen(self, start=False, pve=True, floor=5):
         # Scan screen for any key buttons
         df = self.get_current_icons(available=True)
+        # print(df)
         if not df.empty:
             # list of buttons
             if (df == 'fighting.png').any(axis=None) and not (df == '0cont_button.png').any(axis=None):
@@ -419,61 +539,172 @@ class Bot:
                 time.sleep(1)
                 return df, 'home'
             # Check first button is clickable
-            df_click = df[df['icon'].isin(['back_button.png', 'battle_icon.png', '0cont_button.png', '1quit.png'])]
+            df_click = df[df['icon'].isin(
+                ['back_button.png', 'battle_icon.png', '0cont_button.png', '1quit.png'])]
             if not df_click.empty:
                 button_pos = df_click['pos [X,Y]'].tolist()[0]
                 self.click_button(button_pos)
                 return df, 'menu'
-        self.shell(f'input keyevent {const.KEYCODE_BACK}')  #Force back
+        self.shell(f'input keyevent {const.KEYCODE_BACK}')  # Force back
         return df, 'lost'
 
     # Navigate and locate store refresh button from battle screen
     def find_store_refresh(self):
         self.click_button((100, 1500))  # Click store button
-        [self.swipe([0, 0], [2, 0]) for i in range(5)]  # swipe to top
+        time.sleep(2)
+        [self.swipe([0, 0], [2, 0]) for i in range(20)]  # swipe to top
+        self.click(30, 150)  # stop scroll
+        [self.swipe([2, 0], [0, 0]) for i in range(2)]  # swipe
         self.click(30, 150)  # stop scroll
         avail_buttons = self.get_current_icons(available=True)
+
         if (avail_buttons == 'refresh_button.png').any(axis=None):
             pos = get_button_pos(avail_buttons, 'refresh_button.png')
-            return pos
+
+            if (avail_buttons == 'collected.png').any(axis=None):
+                self.logger.warning('Free item already collected!')
+            else:
+                self.click_button(pos - [300, 820])  # Click first (free) item
+                time.sleep(1)
+                self.click(400, 1110)  # buy
+                time.sleep(1)
+                self.click(15, 1100)  # remove pop-up
+                self.click(15, 1100)  # remove pop-up
+                self.click(15, 1100)  # remove pop-up
+                self.logger.warning('Colected free item!')
+                time.sleep(2)
+
+            if (avail_buttons == 'purchased.png').any(axis=None):
+                self.logger.warning('Last item already purchased!')
+            else:
+                # Click last item (possible legendary)
+                self.click_button(pos + [400, -400])
+                time.sleep(1)
+                self.click(400, 1165)  # buy
+                time.sleep(1)
+                self.click(15, 1100)  # remove pop-up
+                self.click(15, 1100)  # remove pop-up
+                self.click(15, 1100)  # remove pop-up
+                self.logger.warning('Purchased free item!')
+                time.sleep(2)
+
+                if (avail_buttons == 'fragment.png').any(axis=None):
+                    frag_pos = get_button_pos(avail_buttons, 'fragment.png')
+                    self.click_button(frag_pos)
+                    time.sleep(1)
+                    self.click(400, 1110)  # buy
+                    time.sleep(1)
+                    self.click(30, 150)  # remove pop-up
+                    self.click(30, 150)  # remove pop-up
+                    self.click(30, 150)  # remove pop-up
+                    self.logger.warning('Purchased fragment!')
+                    time.sleep(2)
+
+                try:
+                    asyncio.run(telegram_bot.send_image(path=f'bot_feed_{self.bot_id}.png', text='Purchased item!', uid=self.config.get(
+                        'bot', 'telegram_chat_id'), token=self.config.get('bot', 'telegram_token'), crop=True))
+                except Exception as e:
+                    print(e)
+
+            enabled = get_button_enabled(
+                avail_buttons, 'refresh_button.png')
+            if enabled:
+                self.logger.warning('Refreshing the rewards!')
+                return pos
+            else:
+                self.logger.warning('Refresh rewards disabled!')
 
     # Refresh items in shop when available
     def refresh_shop(self):
+        # Watch ad if available
         self.click_button((100, 1500))  # Click store button
         self.click_button((475, 1300))  # Click store button
-        # Scroll up and find the refresh button
+        time.sleep(1.5)
+
+        # Check if there's an item reward for an ad
+        avail_buttons = self.get_current_icons(available=True)
+        if (avail_buttons == 'watch.png').any(axis=None):
+            enabled = get_button_enabled(avail_buttons, 'watch.png')
+            if enabled:
+                self.logger.warning('Found Item to get!')
+                pos = get_button_pos(avail_buttons, 'watch.png')
+                self.click_button(pos + [20, 20])
+                time.sleep(2)
+                self.watch_ad()
+                [self.click(895, 1200)
+                 for i in range(6)]  # click to get the rewards
+                time.sleep(2)
+            else:
+                self.logger.warning('Already took the item!')
+
+        # Scroll up and find the refresh button from tems
         pos = self.find_store_refresh()
         if isinstance(pos, np.ndarray):
-            self.click_button(pos - [300, 820])  # Click first (free) item
-            self.click(400, 1165)  # buy
-            self.click(30, 150)  # remove pop-up
-            self.click_button(pos + [400, -400])  # Click last item (possible legendary)
-            self.click(400, 1165)  # buy
-            self.click(30, 150)  # remove pop-up
-            self.logger.warning('Bought store units!')
             # Try to refresh shop (watch ad)
             self.click_button(pos)
+            time.sleep(2)
+            return True
+        else:
+            return False
+
+    def watch_ad(self):
+        time.sleep(10)
+        avail_buttons = self.get_current_icons(available=True)
+        if (avail_buttons == 'resume.png').any(axis=None):
+            pos = get_button_pos(avail_buttons, 'resume.png')
+            self.click_button(pos)
+        time.sleep(22)
+        # Keep watching until back in menu
+        for i in range(10):
+            avail_buttons, status = self.battle_screen()
+            if status == 'menu' or status == 'home':
+                self.logger.info('FINISHED AD')
+                return  # Exit function
+            time.sleep(2)
+            self.click(858, 50)  # skip forward/click X
+            time.sleep(2)
+            self.click(864, 36)  # click X playstore popup
+            time.sleep(2)
+            if i > 5:
+                # Force back
+                self.shell(f'input keyevent {const.KEYCODE_BACK}')
+            self.logger.info(f'AD TIME {i} {status}')
+        # Restart game if can't escape ad
+        self.restart_RR()
 
     def watch_ads(self):
+        self.logger.info('Finding an ad!')
+        time.sleep(4)
         avail_buttons = self.get_current_icons(available=True)
         # Watch ad if available
         if (avail_buttons == 'quest_done.png').any(axis=None):
             pos = get_button_pos(avail_buttons, 'quest_done.png')
             self.click_button(pos)
+            time.sleep(2)
             self.click(700, 600)  # collect second completed quest
+            time.sleep(2)
             self.click(700, 400)  # collect second completed quest
+            time.sleep(2)
             [self.click(150, 250) for i in range(2)]  # click dailies twice
-            self.click(420, 420)  # collect ad chest
+            time.sleep(1.5)
+            self.click(500, 470)  # collect ad chest
+            time.sleep(1.5)
+            [self.click(880, 1180) for i in range(6)]  # click to skop rewards
         elif (avail_buttons == 'ad_season.png').any(axis=None):
             pos = get_button_pos(avail_buttons, 'ad_season.png')
             self.click_button(pos)
+            time.sleep(2)
         elif (avail_buttons == 'ad_pve.png').any(axis=None):
             pos = get_button_pos(avail_buttons, 'ad_pve.png')
             self.click_button(pos)
+            time.sleep(2)
         elif (avail_buttons == 'battle_icon.png').any(axis=None):
-            self.refresh_shop()
+            has_ad = self.refresh_shop()
+            if not has_ad:
+                self.logger.warning('No add on shop!')
+                return
         else:
-            #self.logger.info('Watched all ads!')
+            self.logger.info('Watched all ads!')
             return
         # Check if ad was started
         avail_buttons, status = self.battle_screen()
@@ -481,39 +712,27 @@ class Bot:
             self.logger.info('FINISHED AD')
         # Watch ad
         else:
-            time.sleep(30)
-            # Keep watching until back in menu
-            for i in range(10):
-                avail_buttons, status = self.battle_screen()
-                if status == 'menu' or status == 'home':
-                    self.logger.info('FINISHED AD')
-                    return  # Exit function
-                time.sleep(2)
-                self.click(870, 30)  # skip forward/click X
-                self.click(870, 100)  # click X playstore popup
-                if i > 5:
-                    self.shell(f'input keyevent {const.KEYCODE_BACK}')  #Force back
-                self.logger.info(f'AD TIME {i} {status}')
-            # Restart game if can't escape ad
-            self.restart_RR()
+            self.watch_ad()
 
 
 ####
-#### END OF CLASS
+# END OF CLASS
 ####
 
 
 # Get fight grid pixel values
 def get_grid():
-    #Grid dimensions
+    # Grid dimensions
     top_box = (153, 945)
     box_size = (120, 120)
     gap = 0
     height = 3
     width = 5
     # x_cords
-    x_cord = list(range(top_box[0], top_box[0] + (box_size[0] + gap) * width, box_size[0] + gap))
-    y_cord = list(range(top_box[1], top_box[1] + (box_size[1] + gap) * height, box_size[1] + gap))
+    x_cord = list(range(top_box[0], top_box[0] +
+                  (box_size[0] + gap) * width, box_size[0] + gap))
+    y_cord = list(range(top_box[1], top_box[1] +
+                  (box_size[1] + gap) * height, box_size[1] + gap))
     boxes = []
     # Create list of all boxes
     for y_point in y_cord:
@@ -549,7 +768,8 @@ def preserve_unit(unit_series, target='chemist.png', keep_min=False):
         else:
             preserve_unit = preserve_series.index.max()
         # Remove 1 count of highest/lowest rank
-        merge_series[merge_series.index == preserve_unit] = merge_series[merge_series.index == preserve_unit] - 1
+        merge_series[merge_series.index ==
+                     preserve_unit] = merge_series[merge_series.index == preserve_unit] - 1
         # Remove 0 counts
         return merge_series[merge_series > 0]
     else:
@@ -569,7 +789,7 @@ def grid_meta_info(grid_df, min_age=0):
     df_split = grid_df.groupby(['unit', 'rank'])
     # Count number of unit of each rank
     unit_series = df_split['unit'].count()
-    #unit_series = unit_series.sort_values(ascending=False)
+    # unit_series = unit_series.sort_values(ascending=False)
     group_keys = list(unit_series.index)
     return df_split, unit_series, df_groups, group_keys
 
@@ -582,14 +802,17 @@ def filter_units(unit_series, units):
     merge_series = unit_series.copy()
     for token in units:
         if isinstance(token, int):
-            exists = merge_series.index.get_level_values('rank').isin([token]).any()
+            exists = merge_series.index.get_level_values(
+                'rank').isin([token]).any()
             if exists:
-                series.append(merge_series.xs(token, level='rank', drop_level=False))
+                series.append(merge_series.xs(
+                    token, level='rank', drop_level=False))
             else:
                 continue  # skip if nothing matches criteria
         elif isinstance(token, str):
             if token in merge_series:
-                series.append(merge_series.xs(token, level='unit', drop_level=False))
+                series.append(merge_series.xs(
+                    token, level='unit', drop_level=False))
             else:
                 continue
     if not len(series) == 0:
@@ -641,6 +864,11 @@ def read_knowledge(bot):
 
 
 def get_button_pos(df, button):
-    #button=button+'.png'
+    # button=button+'.png'
     pos = df[df['icon'] == button]['pos [X,Y]'].reset_index(drop=True)[0]
+    return np.array(pos)
+
+
+def get_button_enabled(df, button):
+    pos = df[df['icon'] == button]['enabled'].reset_index(drop=True)[0]
     return np.array(pos)

@@ -7,3 +7,5 @@ ipykernel
 tqdm
 opencv-python
 ipywidgets
+python-telegram-bot
+pytesseract
